@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 )
 
@@ -19,6 +20,24 @@ const (
 	retryDelay     = 30 * time.Second
 	browserTimeout = 3 * time.Minute
 	renderWait     = 5 * time.Second
+	watermarkJS    = `
+		const watermark = document.createElement('div');
+		watermark.style.cssText = 'position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(-45deg); font-size: 72px; font-family: Arial, sans-serif; color: rgba(0, 0, 0, 0.15); white-space: nowrap; pointer-events: none; user-select: none; z-index: 9999; letter-spacing: 2px;';
+		watermark.innerText = 'isbaileybutlerintheoffice.today';
+		document.body.appendChild(watermark);
+
+		// Create repeating watermark pattern
+		const pattern = document.createElement('div');
+		pattern.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 100px; transform: rotate(-45deg); pointer-events: none; z-index: 9998;';
+		
+		for (let i = 0; i < 9; i++) {
+			const mark = document.createElement('div');
+			mark.style.cssText = 'color: rgba(0, 0, 0, 0.075); font-size: 36px; font-family: Arial, sans-serif; white-space: nowrap; letter-spacing: 1px;';
+			mark.innerText = 'isbaileybutlerintheoffice.today';
+			pattern.appendChild(mark);
+		}
+		document.body.appendChild(pattern);
+	`
 )
 
 func main() {
@@ -145,6 +164,19 @@ func captureScreenshot(ctx context.Context, cfg config, buf *[]byte) error {
 		chromedp.Navigate("https://isbaileybutlerintheoffice.today"),
 		chromedp.WaitVisible("body", chromedp.ByQuery),
 		chromedp.Sleep(renderWait),
+		// Inject watermark before taking screenshot
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			_, exp, err := runtime.Evaluate(watermarkJS).Do(ctx)
+			if err != nil {
+				return err
+			}
+			if exp != nil {
+				return exp
+			}
+			return nil
+		}),
+		// Add a small delay to ensure watermark renders
+		chromedp.Sleep(500*time.Millisecond),
 		chromedp.FullScreenshot(buf, 100),
 	)
 }
