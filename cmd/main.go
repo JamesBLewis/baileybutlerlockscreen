@@ -14,186 +14,153 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
+const (
+	maxRetries     = 3
+	retryDelay     = 30 * time.Second
+	browserTimeout = 3 * time.Minute
+	renderWait     = 5 * time.Second
+)
+
 func main() {
-	// Define flags
+	config := parseFlags()
+	setupLogging()
+	screenshotDir := setupScreenshotDirectory()
+
+	log.Println("Starting screenshot service...")
+	runScreenshotService(config, screenshotDir)
+}
+
+type config struct {
+	width     int
+	height    int
+	sleepTime time.Duration
+}
+
+func parseFlags() config {
 	width := flag.Int("width", 3440, "Width of the screenshot/window")
 	height := flag.Int("height", 1440, "Height of the screenshot/window")
 	sleepTime := flag.Int("sleep", 10, "Sleep time in minutes between screenshots")
 	flag.Parse()
 
-	// Set up logging
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Println("Starting screenshot service...")
-
-	// Create directory for screenshots if it doesn't exist
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		log.Fatal(err)
-	}
-	screenshotDir := filepath.Join(homeDir, "Screenshots")
-	if err := os.MkdirAll(screenshotDir, 0755); err != nil {
-		log.Fatal(err)
-	}
-
-	// Run forever, taking screenshots every sleepTime minutes
-	for {
-		// Try up to 3 times if there's an error
-		var lastErr error
-		for attempts := 0; attempts < 3; attempts++ {
-			if attempts > 0 {
-				log.Printf("Retry attempt %d/3 after failure", attempts+1)
-				time.Sleep(30 * time.Second) // Wait between retries
-			}
-
-			if err := takeAndSetScreenshot(screenshotDir, *width, *height); err != nil {
-				lastErr = err
-				log.Printf("Attempt %d failed with error: %v", attempts+1, err)
-				continue
-			}
-			lastErr = nil
-			break
-		}
-
-		if lastErr != nil {
-			log.Printf("All attempts failed. Last error: %v", lastErr)
-		} else {
-			log.Println("Successfully updated screenshot")
-		}
-
-		log.Printf("Waiting %d minutes before next update...", *sleepTime)
-		time.Sleep(time.Duration(*sleepTime) * time.Minute)
+	return config{
+		width:     *width,
+		height:    *height,
+		sleepTime: time.Duration(*sleepTime) * time.Minute,
 	}
 }
 
-func setLockScreen(path string) error {
-	// First try setting the lock screen
-	lockCmd := `osascript -e '
-        try
-            tell application "System Events"
-                tell every desktop
-                    set pictures folder to "` + filepath.Dir(path) + `"
-                    set picture to "` + path + `"
-                end tell
-            end tell
-            return "Success"
-        on error errMsg
-            return "Error: " & errMsg
-        end try'`
+func setupLogging() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+}
 
-	output, err := exec.Command("bash", "-c", lockCmd).CombinedOutput()
+func setupScreenshotDirectory() string {
+	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return fmt.Errorf("lock screen command failed: %v, output: %s", err, string(output))
+		log.Fatal("Failed to get user home directory:", err)
 	}
 
-	// If that doesn't work, try setting it as the desktop background first
-	if string(output) != "Success" {
-		log.Println("Trying alternate method...")
+	screenshotDir := filepath.Join(homeDir, "Screenshots")
+	if err := os.MkdirAll(screenshotDir, 0755); err != nil {
+		log.Fatal("Failed to create screenshots directory:", err)
+	}
+	return screenshotDir
+}
 
-		desktopCmd := `osascript -e '
-            try
-                tell application "Finder"
-                    set desktop picture to POSIX file "` + path + `"
-                end tell
-                return "Success"
-            on error errMsg
-                return "Error: " & errMsg
-            end try'`
-
-		output, err = exec.Command("bash", "-c", desktopCmd).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("desktop background command failed: %v, output: %s", err, string(output))
+func runScreenshotService(cfg config, dir string) {
+	for {
+		if err := takeScreenshotWithRetry(cfg, dir); err != nil {
+			log.Printf("All screenshot attempts failed: %v", err)
 		}
+
+		log.Printf("Waiting %d minutes before next update...", cfg.sleepTime/time.Minute)
+		time.Sleep(cfg.sleepTime)
+	}
+}
+
+func takeScreenshotWithRetry(cfg config, dir string) error {
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if attempt > 1 {
+			log.Printf("Retry attempt %d/%d", attempt, maxRetries)
+			time.Sleep(retryDelay)
+		}
+
+		if err := takeAndSetScreenshot(cfg, dir); err != nil {
+			lastErr = fmt.Errorf("attempt %d failed: %w", attempt, err)
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
+func takeAndSetScreenshot(cfg config, dir string) error {
+	ctx, cancel := createBrowserContext(cfg)
+	defer cancel()
+
+	filename := fmt.Sprintf("bailey_status_%s.png", time.Now().Format("20060102_150405"))
+	screenshotPath := filepath.Join(dir, filename)
+
+	var buf []byte
+	if err := captureScreenshot(ctx, cfg, &buf); err != nil {
+		return fmt.Errorf("failed to capture screenshot: %w", err)
 	}
 
+	if err := os.WriteFile(screenshotPath, buf, 0644); err != nil {
+		return fmt.Errorf("failed to save screenshot: %w", err)
+	}
+
+	if err := setLockScreen(screenshotPath); err != nil {
+		return fmt.Errorf("failed to set lock screen: %w", err)
+	}
+
+	log.Println("Successfully updated screenshot")
 	return nil
 }
 
-func takeAndSetScreenshot(dir string, width, height int) error {
-	// Create Chrome instance with optimized options
+func createBrowserContext(cfg config) (context.Context, context.CancelFunc) {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", true),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("disable-setuid-sandbox", true),
-		chromedp.Flag("disable-web-security", true),
-		chromedp.Flag("disable-background-networking", false),
-		chromedp.Flag("enable-features", "NetworkService,NetworkServiceInProcess"),
-		chromedp.Flag("ignore-certificate-errors", true),
-		chromedp.WindowSize(width, height),
+		chromedp.WindowSize(cfg.width, cfg.height),
 	)
 
-	// Create allocator context with 2-minute timeout
-	allocCtx, allocCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer allocCancel()
-
-	allocatorContext, cancel := chromedp.NewExecAllocator(allocCtx, opts...)
-	defer cancel()
-
-	// Create browser context with detailed logging
-	ctx, cancel := chromedp.NewContext(
-		allocatorContext,
-		chromedp.WithLogf(func(format string, args ...interface{}) {
-			log.Printf("Browser: "+format, args...)
-		}),
-		chromedp.WithErrorf(func(format string, args ...interface{}) {
-			log.Printf("Browser Error: "+format, args...)
-		}),
+	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	ctx, cancel := chromedp.NewContext(allocCtx,
+		chromedp.WithLogf(log.Printf),
+		chromedp.WithErrorf(log.Printf),
 	)
-	defer cancel()
+	ctx, cancel = context.WithTimeout(ctx, browserTimeout)
+	return ctx, cancel
+}
 
-	// Add timeout for the entire operation
-	ctx, pageCancel := context.WithTimeout(ctx, 3*time.Minute)
-	defer pageCancel()
-
-	// Path for the screenshot
-	screenshotPath := filepath.Join(dir, fmt.Sprintf("bailey_status_%s.png", time.Now().Format("20060102_150405")))
-
-	log.Println("Starting browser and navigating to page...")
-
-	// Take screenshot with enhanced error handling and logging
-	var buf []byte
-	if err := chromedp.Run(ctx,
+func captureScreenshot(ctx context.Context, cfg config, buf *[]byte) error {
+	return chromedp.Run(ctx,
 		network.Enable(),
-		network.SetExtraHTTPHeaders(network.Headers{
-			"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36",
-		}),
-		chromedp.EmulateViewport(int64(width), int64(height)),
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			log.Println("Navigating to page...")
-			return nil
+		network.SetExtraHTTPHeaders(map[string]interface{}{
+			"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
 		}),
 		chromedp.Navigate("https://isbaileybutlerintheoffice.today"),
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			log.Println("Waiting for body to be visible...")
-			return nil
-		}),
 		chromedp.WaitVisible("body", chromedp.ByQuery),
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			log.Println("Waiting for full page render...")
-			return nil
-		}),
-		chromedp.Sleep(5*time.Second),
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			log.Println("Taking screenshot...")
-			return nil
-		}),
-		chromedp.FullScreenshot(&buf, 100),
-	); err != nil {
-		return fmt.Errorf("failed to capture screenshot: %w", err)
+		chromedp.Sleep(renderWait),
+		chromedp.FullScreenshot(buf, 100),
+	)
+}
+
+func setLockScreen(path string) error {
+	script := fmt.Sprintf(`
+		tell application "System Events"
+			tell every desktop
+				set pictures folder to "%s"
+				set picture to "%s"
+			end tell
+		end tell`, filepath.Dir(path), path)
+
+	cmd := exec.Command("osascript", "-e", script)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to set lock screen: %v (output: %s)", err, output)
 	}
-
-	log.Printf("Saving screenshot to: %s", screenshotPath)
-
-	// Save screenshot
-	if err := os.WriteFile(screenshotPath, buf, 0644); err != nil {
-		return fmt.Errorf("failed to save screenshot: %w", err)
-	}
-
-	log.Println("Setting as lock screen...")
-	if err := setLockScreen(screenshotPath); err != nil {
-		return fmt.Errorf("failed to set lock screen: %w", err)
-	}
-
 	return nil
 }
