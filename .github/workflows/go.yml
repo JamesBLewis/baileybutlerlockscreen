@@ -21,7 +21,7 @@ jobs:
       with:
         go-version-file: 'go.mod'
     - name: Build
-      run: go build -v ./...
+      run: go build -v -o baileybutlerlockscreen cmd/main.go
 
     - name: Test
       run: go test -v ./...
